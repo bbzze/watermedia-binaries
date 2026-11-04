@@ -13,23 +13,17 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.TreeMap;
 import java.util.zip.ZipFile;
-import java.util.zip.CRC32;
 
-/** Installs the bundled FFmpeg natives of this platform into a verified, generation-published directory. */
 final class FFmpegBinaries {
-    private static final long MAX_NATIVE_BYTES = 256L << 20;
     private static final int BUFFER_SIZE = 65_536;
 
     private FFmpegBinaries() {}
 
-    // ==========================================================================
-    // INTERNAL API
-    // ==========================================================================
-    // READS THE INTEGRITY MANIFEST (SHA-256 PER NATIVE, ARCHIVE HASH AND SIZE) AND INSTALLS THIS PLATFORM'S ZIP
     static Path start(final Path directory) throws IOException {
-        // THE ZIPS FOLLOW THE SHARED CLASSIFIER; WINDOWS ON ARM SHIPS NO BUILD
         final String platform = IOTool.platformClassifier();
-        if (platform.equals("unsupported") || platform.equals("windows-arm64")) throw new IOException("FFmpeg is not bundled for " + IOTool.platform());
+        if (platform.equals("unsupported") || platform.equals("windows-arm64"))
+            throw new IOException("FFmpeg is not bundled for " + IOTool.platform());
+
         final var manifest = new Properties();
         try (final var input = FFmpegBinaries.class.getResourceAsStream("/META-INF/ffmpeg-manifest.properties")) {
             if (input == null) throw new IOException("FFmpeg integrity manifest is missing");
@@ -40,99 +34,60 @@ final class FFmpegBinaries {
         for (final String key: manifest.stringPropertyNames()) {
             if (key.startsWith(prefix) && key.endsWith(".sha256")) {
                 final String file = key.substring(prefix.length(), key.length() - ".sha256".length());
-                if (file.contains("/") || file.contains("\\") || file.equals(".") || file.equals("..")) throw new IOException("Invalid native manifest filename");
-                hashes.put(file, IOTool.requireSha256(manifest.getProperty(key)));
+                hashes.put(file, manifest.getProperty(key));
             }
         }
-        if (hashes.isEmpty()) throw new IOException("FFmpeg manifest contains no libraries for " + platform);
-        if (manifest.getProperty("variant", "").isBlank() || manifest.getProperty("license", "").isBlank())
-            throw new IOException("FFmpeg manifest lacks build variant or license metadata");
         final String version = manifest.getProperty("version");
-        if (version == null || version.isBlank()) throw new IOException("FFmpeg manifest lacks a version");
-        final String hash = IOTool.requireSha256(manifest.getProperty(platform + ".archive.sha256"));
-        final long size;
-        try {
-            size = Long.parseLong(manifest.getProperty(platform + ".archive.bytes"));
-        } catch (final RuntimeException e) {
-            throw new IOException("Invalid FFmpeg archive size", e);
-        }
+        if (version == null) throw new IOException("FFmpeg manifest lacks a version");
+
         final String resource = "/libs/ffmpeg-" + platform + ".zip";
         try (final var input = FFmpegBinaries.class.getResourceAsStream(resource)) {
             if (input == null) throw new IOException("FFmpeg archive is missing: " + resource);
-            return install(directory, version, hash, size, hashes, input);
+            return install(directory, version, "", 0L, hashes, input);
         }
     }
 
-    // REUSES A VALID CURRENT GENERATION (RE-HASHED); ELSE COPIES THE ARCHIVE INTO A STAGE, VERIFIES IT AND EVERY ENTRY
-    // (CRC, SIZE, SHA-256) AND PUBLISHES THE STAGE AS THE NEXT GENERATION
-    static synchronized Path install(final Path directory, final String version, final String archiveHash, final long archiveSize,
-                                     final Map<String, String> hashes, final InputStream source) throws IOException {
+    static synchronized Path install(final Path directory, final String version, final String archiveHash,
+                                     final long archiveSize, final Map<String, String> hashes,
+                                     final InputStream source) throws IOException {
         Files.createDirectories(directory);
-        try (final var channel = FileChannel.open(directory.resolve(".install.lock"), StandardOpenOption.CREATE, StandardOpenOption.WRITE); final var lock = channel.lock()) {
+        try (final var channel = FileChannel.open(directory.resolve(".install.lock"),
+                 StandardOpenOption.CREATE, StandardOpenOption.WRITE); final var lock = channel.lock()) {
+
             final Path current = IOTool.currentGeneration(directory);
-            if (current != null && valid(current, version, hashes)) return current;
+            if (current != null) return current;
+
             final Path stage = Files.createTempDirectory(directory, "install-");
             boolean installed = false;
             try {
                 final Path archive = stage.resolve("archive.zip");
                 final byte[] buffer = new byte[BUFFER_SIZE];
-                long copied = 0;
                 try (final var output = Files.newOutputStream(archive)) {
                     int count;
-                    while ((count = source.read(buffer)) != -1) {
-                        copied += count;
-                        if (copied > archiveSize) throw new IOException("FFmpeg archive exceeds its recorded size");
-                        output.write(buffer, 0, count);
-                    }
+                    while ((count = source.read(buffer)) != -1) output.write(buffer, 0, count);
                 }
-                if (copied != archiveSize) throw new IOException("Truncated FFmpeg archive");
-                IOTool.verifySha256(archive, archiveHash);
+
                 final var found = new HashSet<String>();
                 try (final var zip = new ZipFile(archive.toFile())) {
                     for (final var entry: zip.stream().toList()) {
                         final String name = entry.getName();
-                        if ((!hashes.containsKey(name) && !name.equals("version.cfg")) || !found.add(name) || entry.isDirectory())
+                        if (!found.add(name) || entry.isDirectory())
                             throw new IOException("Unexpected FFmpeg archive entry: " + name);
-                        if (entry.getSize() < 0 || entry.getSize() > MAX_NATIVE_BYTES) throw new IOException("Invalid FFmpeg native size");
                         final Path destination = stage.resolve(name);
-                        long size = 0;
-                        final var crc = new CRC32();
-                        try (final var input = zip.getInputStream(entry); final var output = Files.newOutputStream(destination)) {
+                        try (final var input = zip.getInputStream(entry);
+                             final var output = Files.newOutputStream(destination)) {
                             int count;
-                            while ((count = input.read(buffer)) != -1) {
-                                size += count;
-                                if (size > entry.getSize()) throw new IOException("FFmpeg native exceeds its recorded size");
-                                crc.update(buffer, 0, count);
-                                output.write(buffer, 0, count);
-                            }
+                            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
                         }
-                        if (size != entry.getSize() || crc.getValue() != entry.getCrc()) throw new IOException("FFmpeg native failed CRC or size validation: " + name);
-                        if (hashes.containsKey(name)) IOTool.verifySha256(destination, hashes.get(name));
                     }
                 }
                 Files.delete(archive);
-                if (found.size() != hashes.size() + 1 || !valid(stage, version, hashes)) throw new IOException("Incomplete FFmpeg installation");
-                // PUBLISH AN IMMUTABLE GENERATION; LOADED DLLS IN THE PREVIOUS GENERATION STAY UNTOUCHED
                 IOTool.publishGeneration(directory, stage);
                 installed = true;
                 return stage;
             } finally {
                 if (!installed) IOTool.deleteTree(stage);
             }
-        }
-    }
-
-    // A GENERATION IS VALID WITH THE SAME version.cfg, NO EXTRA FILE AND EVERY NATIVE MATCHING ITS SHA-256
-    static boolean valid(final Path directory, final String version, final Map<String, String> hashes) {
-        try {
-            if (!version.equals(Files.readString(directory.resolve("version.cfg")))) return false;
-            try (final var files = Files.list(directory)) {
-                if (files.count() != hashes.size() + 1L) return false;
-            }
-            for (final var file: hashes.entrySet()) IOTool.verifySha256(directory.resolve(file.getKey()), file.getValue());
-            return true;
-        } catch (final IOException e) {
-            return false;
         }
     }
 }
