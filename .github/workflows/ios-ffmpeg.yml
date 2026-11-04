@@ -1,0 +1,128 @@
+name: Build Patched FFmpeg for iOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build iOS arm64
+    runs-on: macos-14
+
+    env:
+      OPENSSL_VERSION: "3.5.8"
+      OPENSSL_SHA256: a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2
+      LIBXML2_VERSION: "2.15.4"
+      LIBXML2_SHA256: 98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821
+      # the commit of WaterMedia's JavaCPP Presets fork that holds ffmpeg-tls.patch (same one the original natives were built from)
+      PRESETS_COMMIT: d07dc23746b44f4fbeb8246d5749314ec0123c94
+      HEADERS_PATCH_SHA256: a0d41707d7119c6d49b8add5b0731d7f8b367a7023334f987ad8ae713e7a3d9e
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up build dependencies
+        run: brew install nasm pkg-config
+
+      # HTTPS needs a TLS library, built first as a static library and linked into libavformat.
+      - name: Build OpenSSL for iOS (static)
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          echo "${OPENSSL_SHA256}  openssl.tar.gz" | shasum -a 256 -c -
+          tar xzf openssl.tar.gz
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure ios64-xcrun no-shared no-tests no-ssl3 no-comp no-engine no-dso no-async \
+            -mios-version-min=14.0 --prefix="${{ github.workspace }}/openssl-ios"
+          make -j"$(sysctl -n hw.ncpu)" build_libs
+          make install_dev
+          ls -la "${{ github.workspace }}/openssl-ios/lib"
+
+      # The DASH demuxer cannot exist without libxml2 (WaterMedia requires the dash demuxer).
+      - name: Build libxml2 for iOS (static)
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o libxml2.tar.xz "https://download.gnome.org/sources/libxml2/2.15/libxml2-${LIBXML2_VERSION}.tar.xz"
+          echo "${LIBXML2_SHA256}  libxml2.tar.xz" | shasum -a 256 -c -
+          tar xf libxml2.tar.xz
+          cd "libxml2-${LIBXML2_VERSION}"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          ./configure \
+            --host=aarch64-apple-darwin \
+            --prefix="${{ github.workspace }}/libxml2-ios" \
+            --disable-shared --enable-static \
+            --without-python --without-iconv --without-icu --without-lzma --without-zlib \
+            --without-http --without-ftp --without-modules --without-readline --without-history \
+            --without-programs --without-tests \
+            CC="xcrun -sdk iphoneos clang" \
+            CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=14.0 -O2 -fPIC" \
+            LDFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=14.0"
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+          ls -la "${{ github.workspace }}/libxml2-ios/lib" "${{ github.workspace }}/libxml2-ios/lib/pkgconfig"
+
+      - name: Clone FFmpeg
+        run: |
+          git clone --depth 1 --branch n9.0.2 https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+      # WaterMedia refuses to start FFmpeg without these two patches:
+      #  - ffmpeg-tls.patch (from the fork the original natives came from) adds the trust options to http, hls and dash
+      #  - ffmpeg-headers.patch (from this repository) adds header_origin to http
+      - name: Apply the WaterMedia FFmpeg patches
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o ffmpeg-tls.patch "https://raw.githubusercontent.com/SrRapero720/javacpp-presets/${PRESETS_COMMIT}/ffmpeg/ffmpeg-tls.patch"
+          echo "${HEADERS_PATCH_SHA256}  tools/ffmpeg-headers.patch" | shasum -a 256 -c -
+          wc -l ffmpeg-tls.patch tools/ffmpeg-headers.patch
+          cd ffmpeg
+          for P in ../ffmpeg-tls.patch ../tools/ffmpeg-headers.patch; do
+            echo "=== applying $P"
+            git apply --whitespace=nowarn "$P" || patch -Np1 < "$P"
+          done
+          echo "--- patch result (each line must find something) ---"
+          grep -n "protocol_opts" libavformat/hls.c libavformat/dash.c
+          grep -n "header_origin" libavformat/http.c | head -3
+
+      - name: Apply the iOS source fixes
+        run: |
+          cd ffmpeg
+
+          # GET OUT OF MY BINARY
+          sed -i '' 's/VTRegisterProfessionalVideoWorkflowVideoDecoders();/#if !TARGET_OS_IPHONE\n    VTRegisterProfessionalVideoWorkflowVideoDecoders();\n#endif/' libavcodec/videotoolbox.c
+
+          printf '\n#include <CoreVideo/CoreVideo.h>\n__attribute__((constructor, used))\nstatic void _wm_force_metal_key_ref(void) {\n    __asm__ volatile("" : : "r"(&kCVPixelBufferMetalCompatibilityKey) : "memory");\n}\n' >> libavcodec/videotoolbox.c
+          grep -n "force_metal_key_ref" libavcodec/videotoolbox.c || echo "NOT IN SOURCE"
+
+      - name: Configure and build FFmpeg for iOS
+        run: |
+          set -euo pipefail
+          cd ffmpeg
+          OPENSSL="${{ github.workspace }}/openssl-ios"
+          XML="${{ github.workspace }}/libxml2-ios"
+          export PKG_CONFIG_LIBDIR="$OPENSSL/lib/pkgconfig:$XML/lib/pkgconfig"
+          ./configure \
+            --sysroot="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            --prefix=${{ github.workspace }}/ffmpeg-ios \
+            --enable-cross-compile \
+            --target-os=darwin \
+            --arch=arm64 \
+            --cc="xcrun -sdk iphoneos clang" \
+            --extra-cflags="-arch arm64 -miphoneos-version-min=14.0 -I$OPENSSL/include -I$XML/include/libxml2" \
+            --extra-ldflags="-arch arm64 -L$OPENSSL/lib -L$XML/lib -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreFoundation -framework Foundation -framework Security -framework AudioToolbox" \
+            --pkg-config-flags="--static" \
+            --enable-shared \
+            --disable-static \
+            --enable-videotoolbox \
+            --enable-audiotoolbox \
+            --enable-openssl \
+            --enable-libxml2 \
+            --enable-version3 \
+            
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      - name: Upload built libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-ios-libs-network
+          path: ${{ github.workspace }}/ffmpeg-ios/lib/
