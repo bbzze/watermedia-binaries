@@ -1,0 +1,67 @@
+name: Build without natives
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: watermedia/binaries
+
+    steps:
+      - name: Checkout WaterMedia provider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: WaterMediaTeam/watermedia-v3
+          path: watermedia
+
+      - name: Checkout Binaries revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: watermedia/binaries
+
+      - name: Read build versions
+        id: versions
+        shell: pwsh
+        run: |
+          $gradleVersion = ((Get-Content gradle.properties | Select-String '^gradle_version=').Line -split '=', 2)[1]
+          Add-Content $env:GITHUB_OUTPUT "gradle=$gradleVersion"
+
+      - name: Set up patched Java
+        shell: pwsh
+        run: ./tools/SetupJava.ps1 -Platform linux-x86_64
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
+        with:
+          gradle-version: ${{ steps.versions.outputs.gradle }}
+
+      # The natives are the only big files in the project. Removing them here (only inside this temporary build
+      # machine, your repo is not touched) is what makes the jar small and native-free.
+      - name: Remove the bundled natives
+        run: |
+          rm -f src/main/resources/libs/ffmpeg-*.zip
+          echo "Natives left in src/main/resources/libs:"
+          ls -la src/main/resources/libs || true
+
+      # shadowJar builds the final mod jar and skips the tests (they need the natives to pass).
+      - name: Build the jar
+        run: gradle shadowJar
+
+      - name: Show what is inside the jar
+        run: |
+          ls -la build/libs
+          unzip -l build/libs/*.jar | grep -i -E "ffmpeg|libs/|manifest|mods.toml|fabric.mod" || true
+
+      - name: Upload the jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: watermedia-binaries-no-natives
+          path: watermedia/binaries/build/libs/*.jar
+          if-no-files-found: error
+          compression-level: 9
