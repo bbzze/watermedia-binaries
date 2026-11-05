@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: SrRapero720/watermedia
-          ref: main
+          ref: 856bdd7cc6ae637e7810a5c06dea8689d0130fc1
           path: watermedia
 
       # your modified binaries (the core builds against them)
