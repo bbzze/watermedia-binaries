@@ -44,9 +44,21 @@ edit('src/main/java/org/watermedia/api/platform/web/YtDlpPlatform.java',
         final Path exe;''')
 
 # 3. build.gradle: bundle the extractor (and what it needs) into the mod jar, like javacpp
+# the extractor drags in annotation-only libraries (jsr305 and friends). The game already loads those as modules, and two
+# modules exporting the same package (javax.annotation) stops Minecraft before it starts, so they are NOT bundled
 edit('build.gradle',
      '''    include "org.bytedeco:javacpp:$javacppVersion"
 ''',
      '''    include "org.bytedeco:javacpp:$javacppVersion"
-    include "com.github.TeamNewPipe:NewPipeExtractor:%s"
+    include("com.github.TeamNewPipe:NewPipeExtractor:%s") {
+        exclude group: 'com.google.code.findbugs', module: 'jsr305'
+        exclude group: 'com.github.spotbugs', module: 'spotbugs-annotations'
+        exclude group: 'org.jetbrains', module: 'annotations'
+    }
 ''' % NEWPIPE)
+
+# safety net: whatever way they get in, these packages never end up inside the WaterMedia jar
+edit('build.gradle',
+     "    exclude 'META-INF/versions/', 'META-INF/maven/**/*.xml', 'org/watermedia/binaries/**'",
+     "    exclude 'META-INF/versions/', 'META-INF/maven/**/*.xml', 'org/watermedia/binaries/**'\n"
+     "    exclude 'javax/annotation/**', 'edu/umd/cs/findbugs/annotations/**', 'org/jetbrains/annotations/**', 'org/intellij/lang/annotations/**', 'module-info.class'")
