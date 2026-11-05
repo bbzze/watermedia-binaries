@@ -1,0 +1,77 @@
+name: Build WaterMedia core with YouTube (NewPipe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      newpipe_version:
+        description: NewPipeExtractor version (JitPack tag). Raise it when YouTube stops working.
+        required: false
+        default: v0.26.5
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      NEWPIPE_VERSION: ${{ inputs.newpipe_version }}
+      ALSOFT_DRIVERS: 'null'
+
+    steps:
+      # the WaterMedia core exactly as it was when you downloaded it
+      - name: Checkout WaterMedia core
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: WaterMediaTeam/watermedia-v3
+          ref: 856bdd7cc6ae637e7810a5c06dea8689d0130fc1
+          path: watermedia
+
+      # your modified binaries (the core builds against them)
+      - name: Checkout your Binaries
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: watermedia/binaries
+
+      - name: Add the NewPipe backend
+        working-directory: watermedia
+        run: python3 binaries/youtube-newpipe/core-patch/apply.py
+
+      - name: Read build versions
+        id: versions
+        working-directory: watermedia
+        shell: pwsh
+        run: |
+          $gradleVersion = ((Get-Content gradle.properties | Select-String '^gradle_version=').Line -split '=', 2)[1]
+          Add-Content $env:GITHUB_OUTPUT "gradle=$gradleVersion"
+
+      - name: Set up patched Java
+        working-directory: watermedia
+        shell: pwsh
+        run: ./binaries/tools/SetupJava.ps1 -Platform linux-x86_64 -ProjectRoot .
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
+        with:
+          gradle-version: ${{ steps.versions.outputs.gradle }}
+
+      # "jar" builds the mod jar and skips the tests
+      - name: Build the jar
+        working-directory: watermedia
+        run: gradle jar
+
+      - name: Check the jar
+        working-directory: watermedia
+        run: |
+          ls -la build/libs
+          echo "NewPipe classes inside the jar:"
+          unzip -l build/libs/watermedia-*.jar | grep -c "org/schabi/newpipe/extractor/" || true
+          unzip -l build/libs/watermedia-*.jar | grep -E "NewPipeBackend|org/mozilla/javascript/Context.class" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watermedia-core-with-newpipe
+          path: watermedia/build/libs/watermedia-*.jar
+          if-no-files-found: error
+          compression-level: 9
